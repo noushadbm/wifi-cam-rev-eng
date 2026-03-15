@@ -108,25 +108,16 @@ class P2PClient:
         return payload
 
     def extractTokenFromCamInfo(self, data):
-        """
-        Camera info packet (20 bytes total):
-            f1 d0 00 10   PPPP header      (4 bytes)
-            d1 00 00 00   DRW header       (4 bytes)
-            01 0a 20 11   inner cmd        (4 bytes)
-            04 00 ff 00   flags            (4 bytes)
-            XX XX XX XX   token            (4 bytes)  ← offset 16
-        """
         if len(data) < 20 or data[0] != P2P_MAGIC_NUM or data[1] != MSG_DRW:
             return None
-
-        # Inner cmd byte at offset 10 — accept both 0x11 variants
-        inner_cmd_byte = data[10]
-        logging.debug('Inner cmd byte: 0x%02x' % inner_cmd_byte)
-
-        if inner_cmd_byte not in [0x11, 0x20]:
+        drw_payload = data[8:]          # skip PPPP(4) + DRW header(4)
+        if len(drw_payload) < 12:
             return None
-
-        token = bytes(data[16:20])
+        # Inner cmd at index 3 of drw_payload
+        if drw_payload[3] != 0x11:
+            logging.debug('Not cam info (byte3=0x%02x)' % drw_payload[3])
+            return None
+        token = bytes(drw_payload[8:12])
         logging.debug('Token: %s' % token.hex())
         return token
 
@@ -308,24 +299,87 @@ class P2PClient:
             logging.warning('[!] No token received — trying with zero token')
             token = b'\x00\x00\x00\x00'
 
-        # Step 6: Send video stream request
-        video_req = self.createDRWMessage(channel=0,
-                        payload=self.createVideoRequestPayload(token))
-        s.sendto(video_req, camera_addr)
-        logging.info('[>] Sent video stream request: %s' % video_req.hex())
+        # Step 6: Keep responding to camera info (0x11) with video request (0x10)
+        # until the camera starts sending actual video data
+        logging.info('[*] Negotiating video stream...')
 
-        # Step 7: Receive video stream and save to file
-        logging.info('[*] Receiving video stream → %s (for %ds)...' % (output_file, duration))
-        logging.info('[*] Press Ctrl+C to stop early\n')
+        MAX_NEGOTIATION_ROUNDS = 20
+        video_started = False
 
-        h264_frames   = 0
-        bytes_written  = 0
-        start_time     = time.time()
-        last_alive     = time.time()
+        for round in range(MAX_NEGOTIATION_ROUNDS):
+            # Send video request with current token
+            video_req_payload = self.createVideoRequestPayload(token)
+            video_req = self.createDRWMessage(channel=0, payload=video_req_payload)
+            s.sendto(video_req, camera_addr)
+            logging.debug('[>] Video request round %d token=%s: %s'
+                        % (round, token.hex(), video_req.hex()))
+
+            # Wait for camera response
+            got_response = False
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                try:
+                    data, _ = s.recvfrom(65535)
+                    logging.debug('[<] Negotiation 0x%02x (%d bytes): %s'
+                                % (data[1], len(data), data.hex()))
+
+                    if data[1] == MSG_ALIVE:
+                        s.sendto(self.createP2PMessage(MSG_ALIVE_ACK), camera_addr)
+                        logging.debug('[>] MSG_ALIVE_ACK')
+                        continue  # ← keep waiting, don't break
+
+                    if data[1] == MSG_DRW_ACK:
+                        logging.debug('[<] DRW_ACK')
+                        continue  # ← keep waiting
+
+                    if data[1] == MSG_DRW:
+                        drw_payload = data[8:]
+
+                        # Camera challenge: inner cmd byte at index 3
+                        if len(drw_payload) >= 12 and drw_payload[3] == 0x11:
+                            new_token = bytes(drw_payload[8:12])
+                            logging.info('[*] Challenge round %d: token %s → %s'
+                                        % (round, token.hex(), new_token.hex()))
+                            token = new_token
+                            got_response = True
+                            break
+
+                        # H.264 NAL start code
+                        elif (drw_payload[0:4] == b'\x00\x00\x00\x01' or
+                            drw_payload[0:3] == b'\x00\x00\x01'):
+                            logging.info('[*] Video stream started!')
+                            video_started = True
+                            break
+
+                        else:
+                            logging.debug('[<] Unknown DRW: %s' % drw_payload[:32].hex())
+                            got_response = True
+                            break
+
+                except socket.timeout:
+                    break
+
+            if video_started:
+                break
+
+            if not got_response:
+                logging.warning('[!] No response in round %d, retrying...' % round)
+
+        if not video_started:
+            logging.warning('[!] Video did not start after negotiation — saving raw DRW data anyway')
+
+
+         # Step 7: Receive and save video stream
+        logging.info('[*] Saving stream → %s (for %ds)...' % (output_file, duration))
+
+        h264_frames  = 0
+        bytes_written = 0
+        start_time   = time.time()
+        last_alive   = time.time()
 
         with open(output_file, 'wb') as f:
             while time.time() - start_time < duration:
-                # Send keepalive every second
+
                 if time.time() - last_alive > 1.0:
                     s.sendto(self.createP2PMessage(MSG_ALIVE), camera_addr)
                     last_alive = time.time()
@@ -338,49 +392,45 @@ class P2PClient:
                         continue
 
                     if data[1] == MSG_DRW_ACK:
-                        logging.debug('[<] DRW_ACK')
                         continue
 
                     if data[1] == MSG_DRW:
-                        # DRW payload starts at byte 4 (pppp header)
-                        # DRW sub-header is 4 bytes, so video data starts at byte 8
-                        # Video packets have inner cmd 0x00 or raw H.264 NAL units
-                        drw_payload = data[8:]  # skip PPPP(4) + DRW header(4)
+                        drw_payload = data[8:]
 
-                        # Check if this looks like H.264 NAL unit
-                        # H.264 NAL start codes: 00 00 00 01 or 00 00 01
-                        if (len(drw_payload) > 4 and
-                            (drw_payload[0:4] == b'\x00\x00\x00\x01' or
-                             drw_payload[0:3] == b'\x00\x00\x01')):
-                            f.write(drw_payload)
-                            f.flush()
+                        # If another challenge arrives during streaming, respond
+                        if len(drw_payload) >= 4 and drw_payload[2] == 0x11:
+                            token = bytes(data[16:20])
+                            logging.debug('[*] Re-challenge during stream, token: %s' % token.hex())
+                            video_req = self.createDRWMessage(channel=0,
+                                            payload=self.createVideoRequestPayload(token))
+                            s.sendto(video_req, camera_addr)
+                            continue
+
+                        # Write all DRW data to file for analysis
+                        f.write(drw_payload)
+                        f.flush()
+                        bytes_written += len(drw_payload)
+
+                        # Check for H.264 NAL units
+                        if (drw_payload[0:4] == b'\x00\x00\x00\x01' or
+                            drw_payload[0:3] == b'\x00\x00\x01'):
                             h264_frames += 1
-                            bytes_written += len(drw_payload)
                             if h264_frames % 30 == 0:
                                 elapsed = time.time() - start_time
-                                logging.info('[*] %d frames, %d bytes, %.1fs elapsed'
-                                             % (h264_frames, bytes_written, elapsed))
+                                logging.info('[*] %d H264 frames, %d bytes, %.1fs'
+                                            % (h264_frames, bytes_written, elapsed))
                         else:
-                            # Not raw H.264 — dump first 32 bytes for analysis
-                            logging.debug('[<] DRW data (not H264?): %s'
-                                          % drw_payload[:32].hex())
-                            # Write it anyway — we can analyze the file later
-                            f.write(drw_payload)
-                            f.flush()
-                            bytes_written += len(drw_payload)
+                            logging.debug('[<] DRW payload: %s' % drw_payload[:32].hex())
 
                 except socket.timeout:
-                    logging.debug('[.] timeout, waiting for video...')
                     continue
                 except KeyboardInterrupt:
                     logging.info('\n[*] Stopped by user')
                     break
 
-        logging.info('[*] Stream saved: %d bytes, %d H.264 frames → %s'
-                     % (bytes_written, h264_frames, output_file))
-        logging.info('[*] Play with: ffplay %s' % output_file)
-        logging.info('[*]        or: vlc %s' % output_file)
-
+        logging.info('[*] Done: %d bytes, %d H264 frames → %s'
+                    % (bytes_written, h264_frames, output_file))
+        logging.info('[*] Play: ffplay %s  or  vlc %s' % (output_file, output_file))
         s.close()
         return bytes_written > 0
 
