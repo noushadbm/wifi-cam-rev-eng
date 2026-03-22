@@ -1,3 +1,5 @@
+This python code used to connect with mini wifi camera (XD camera) running in LAN. It will generate a video and audio file for 30 seconds. The camera username and password is hardcoded in code.
+
 ### Steps
 
 Setting up python environment and activating it.
