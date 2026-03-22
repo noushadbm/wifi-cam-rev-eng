@@ -86,7 +86,7 @@ class P2PClient:
         TOTAL_LEN    = 172
 
         inner_header = bytes([
-            0x01, 0x0a, 0x20, 0x10,
+            0x11, 0x0a, 0x20, 0x10,   # ← 0x11 not 0x01
             0xa4, 0x00, 0xff, 0x00,
             0x00, 0x00
         ])
@@ -94,6 +94,28 @@ class P2PClient:
         body += password.encode('utf-8').ljust(PASSWORD_LEN, b'\x00')[:PASSWORD_LEN]
         payload = inner_header + body
         payload += b'\x00' * (TOTAL_LEN - len(payload))
+        return payload
+
+    def createConnectUserPayload(self, ticket):
+        """
+        Try both XOR'd and raw ticket — our camera may differ from cam-reverse.
+        cam-reverse XORs with 0x01, but our camera's ticket 0efcffff may be used raw.
+        """
+        # XOR ticket with 0x01 as cam-reverse does
+        xor_ticket = bytes([b ^ 0x01 for b in ticket])
+
+        payload = bytes([0x11, 0x0a, 0x18, 0x30,  # cmd ConnectUser
+                        0x0c, 0x00, 0x00, 0x00])  # flags
+        payload += xor_ticket
+        payload += bytes([0x03, 0x01, 0x01, 0x01,
+                        0x00, 0x01, 0x01, 0x01])
+        return payload
+
+    def createStreamStartPayload(self, ticket):
+        xor_ticket = bytes([b ^ 0x01 for b in ticket])
+        payload = bytes([0x11, 0x0a, 0x10, 0x30,
+                        0x04, 0x00, 0x00, 0x00])
+        payload += xor_ticket
         return payload
 
     def createVideoRequestPayload(self, token):
@@ -254,7 +276,7 @@ class P2PClient:
     # ------------------------------------------------------------------ #
 
     def streamVideo(self, device, username='admin', password='WuZfSZHC',
-                    output_file='stream.h264', duration=30):
+                    output_file='stream.mjpeg', duration=30):
 
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(2)
@@ -264,25 +286,15 @@ class P2PClient:
             s.close()
             return False
 
-        # Get camera info token
-        token = None
-        # Step 5b: Send capabilities request with 0x80 flag
-        logging.info('[*] Requesting camera capabilities...')
-        caps_req = self.createDRWMessage(channel=0, payload=bytes([
-            0x01, 0x0a, 0x08, 0x10,
-            0x80, 0x00, 0xff, 0x00,
-            0x00, 0x00, 0x00, 0x00
-        ]))
-        s.sendto(caps_req, camera_addr)
-        logging.debug('[>] Caps request: %s' % caps_req.hex())
-
-        # Wait for full capabilities response (should be ~144 bytes)
+        # Step 5: Wait for ConnectUserAck
+        ticket = None
+        logging.info('[*] Waiting for ConnectUserAck (ticket)...')
         deadline = time.time() + 3.0
         while time.time() < deadline:
             try:
                 data, _ = s.recvfrom(4096)
-                logging.debug('[<] Caps response 0x%02x (%d bytes): %s'
-                              % (data[1], len(data), data.hex()))
+                logging.debug('[<] Post-login 0x%02x (%d bytes): %s'
+                            % (data[1], len(data), data.hex()))
 
                 if data[1] == MSG_ALIVE:
                     s.sendto(self.createP2PMessage(MSG_ALIVE_ACK), camera_addr)
@@ -293,131 +305,232 @@ class P2PClient:
 
                 if data[1] == MSG_DRW:
                     drw_payload = data[8:]
-                    logging.info('[*] Caps DRW (%d bytes): %s'
-                                % (len(drw_payload), drw_payload.hex()))
+                    logging.debug('[*] DRW payload: %s' % drw_payload.hex())
 
-                    # Full caps response is large (128+ bytes) with positive token
-                    if len(drw_payload) >= 12:
-                        token_val = int.from_bytes(drw_payload[8:12], 'little')
-                        logging.info('[*] Token value: %d (0x%08x)' % (token_val, token_val & 0xFFFFFFFF))
+                    # Accept ANY 0x20 0x11 packet as the ticket — ignore flags byte
+                    if (len(drw_payload) >= 12 and
+                        drw_payload[2] == 0x20 and drw_payload[3] == 0x11):
+                        ticket = bytes(drw_payload[8:12])
+                        logging.info('[*] Got ticket: %s (raw, will XOR for use)'
+                                    % ticket.hex())
+                        break
 
-                        if token_val >= 0 or len(drw_payload) > 20:
-                            # Positive value or large packet = real token/caps data
-                            token = bytes(drw_payload[8:12])
-                            logging.info('[*] Got real token: %s' % token.hex())
-                            break
             except socket.timeout:
                 break
 
-        if token is None:
-            logging.warning('[!] No token — using zero token')
-            token = b'\x00\x00\x00\x00'
+        if ticket is None:
+            logging.error('[!] No ticket received — cannot start stream')
+            s.close()
+            return False
 
-        # Try all combinations of cmd family + token
-        VIDEO_COMMANDS = [
-            (bytes([0x01, 0x0a, 0x08, 0x10, 0x04, 0x00, 0xff, 0x00]), 'family=0x08'),
-            (bytes([0x01, 0x0a, 0x20, 0x10, 0x04, 0x00, 0xff, 0x00]), 'family=0x20'),
-            (bytes([0x01, 0x0a, 0x08, 0x00, 0x04, 0x00, 0xff, 0x00]), 'family=0x08 cmd=0x00'),
-            (bytes([0x01, 0x0a, 0x01, 0x00, 0x04, 0x00, 0xff, 0x00]), 'family=0x01'),
-        ]
+        # Step 6: Send ConnectUser (0x1830)
+        connect_pkt = self.createDRWMessage(channel=0,
+                        payload=self.createConnectUserPayload(ticket))
+        s.sendto(connect_pkt, camera_addr)
+        logging.info('[>] Sent ConnectUser: %s' % connect_pkt.hex())
 
-        for cmd_header, cmd_name in VIDEO_COMMANDS:
-            payload = cmd_header + token
-            video_req = self.createDRWMessage(channel=0, payload=payload)
-            s.sendto(video_req, camera_addr)
-            logging.info('[>] Trying video cmd %s token=%s: %s'
-                        % (cmd_name, token.hex(), video_req.hex()))
+        # Step 7: Send StreamStart (0x1030)
+        stream_pkt = self.createDRWMessage(channel=0,
+                        payload=self.createStreamStartPayload(ticket))
+        s.sendto(stream_pkt, camera_addr)
+        logging.info('[>] Sent StreamStart: %s' % stream_pkt.hex())
 
-            # Wait for response
-            deadline = time.time() + 2.0
-            got_video = False
-            while time.time() < deadline:
-                try:
-                    data, _ = s.recvfrom(65535)
-                    logging.debug('[<] Response 0x%02x (%d bytes): %s'
-                                % (data[1], len(data), data.hex()))
+        # Step 8: Wait for ConnectUserAck (0x1831) and StreamStartAck (0x1031)
+        # IMPORTANT: ACK every control DRW the camera sends
+        confirmed_ticket = None
+        stream_ack_received = False
+        logging.info('[*] Waiting for stream ACKs...')
 
-                    if data[1] == MSG_ALIVE:
-                        s.sendto(self.createP2PMessage(MSG_ALIVE_ACK), camera_addr)
-                        continue
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            try:
+                data, _ = s.recvfrom(4096)
+                logging.debug('[<] ACK phase 0x%02x (%d bytes): %s'
+                            % (data[1], len(data), data.hex()))
 
-                    if data[1] == MSG_DRW_ACK:
-                        continue
+                if data[1] == MSG_ALIVE:
+                    s.sendto(self.createP2PMessage(MSG_ALIVE_ACK), camera_addr)
+                    continue
 
-                    if data[1] == MSG_DRW:
-                        drw_payload = data[8:]
-                        logging.info('[*] DRW response to %s: %s'
-                                    % (cmd_name, drw_payload[:32].hex()))
+                if data[1] == MSG_DRW_ACK:
+                    continue
 
-                        # Check for video data
-                        if (drw_payload[0:4] == b'\x00\x00\x00\x01' or
-                            drw_payload[0:3] == b'\x00\x00\x01'):
-                            logging.info('[+] VIDEO STREAM STARTED with %s!' % cmd_name)
-                            got_video = True
-                            break
+                if data[1] == MSG_DRW:
+                    drw_payload = data[8:]
+                    pkt_id      = int.from_bytes(data[6:8], 'big')
+                    stream_byte = data[5]
+                    cmd = (drw_payload[2] << 8) | drw_payload[3]
+                    token = bytes(drw_payload[8:12]) if len(drw_payload) >= 12 else b'\x00'*4
 
-                        # New token in response?
-                        if len(drw_payload) >= 12 and drw_payload[3] == 0x11:
-                            new_token = bytes(drw_payload[8:12])
-                            logging.info('[*] New token from camera: %s' % new_token.hex())
-                            token = new_token
+                    logging.info('[*] Camera cmd=0x%04x stream=%d token=%s'
+                                % (cmd, stream_byte, token.hex()))
 
-                except socket.timeout:
-                    break
+                    # Always ACK control DRW packets
+                    if stream_byte == 0x00:
+                        ack = bytearray(14)
+                        ack[0] = P2P_MAGIC_NUM
+                        ack[1] = MSG_DRW_ACK
+                        ack[2:4] = (10).to_bytes(2, 'big')
+                        ack[4] = 0xd2
+                        ack[5] = 0x00   # control stream
+                        ack[6:8] = (1).to_bytes(2, 'big')
+                        ack[8:10] = pkt_id.to_bytes(2, 'big')
+                        s.sendto(bytes(ack), camera_addr)
+                        logging.debug('[>] Sent DRW_ACK for control pkt %d' % pkt_id)
 
-            if got_video:
+                    if cmd == 0x1831:
+                        confirmed_ticket = token
+                        logging.info('[*] ConnectUserAck ticket: %s' % token.hex())
+
+                    elif cmd == 0x1031:
+                        stream_ack_received = True
+                        logging.info('[*] StreamStartAck — video should follow!')
+                        # Do NOT send another StreamStart here — just wait for video
+                        break
+
+                    # If camera sends data already (stream_byte==1), video has started
+                    elif stream_byte == 0x01:
+                        logging.info('[*] Video data already arriving!')
+                        stream_ack_received = True
+                        break
+
+            except socket.timeout:
                 break
 
-        # Receive and save stream
-        logging.info('[*] Saving stream → %s (%ds)...' % (output_file, duration))
-        bytes_written = 0
-        h264_frames   = 0
+        # Step 9: No more StreamStart — video should flow after StreamStartAck ACK
+        # Just go straight to receiving
+        logging.info('[*] Waiting for video data...')
+
+        # Step 10: Receive MJPEG stream
+        logging.info('[*] Receiving MJPEG stream → %s (%ds)...' % (output_file, duration))
+        logging.info('[*] Press Ctrl+C to stop\n')
+
+        FRAME_HEADER  = b'\x55\xaa\x15\xa8'
+        JPEG_HEADER   = b'\xff\xd8\xff'
+        frame_count   = 0
+        bytes_written  = 0
         start_time    = time.time()
         last_alive    = time.time()
+        current_jpeg  = bytearray()
+        got_any_data  = False
 
         with open(output_file, 'wb') as f:
             while time.time() - start_time < duration:
+
                 if time.time() - last_alive > 1.0:
                     s.sendto(self.createP2PMessage(MSG_ALIVE), camera_addr)
                     last_alive = time.time()
+
                 try:
                     data, _ = s.recvfrom(65535)
+
                     if data[1] == MSG_ALIVE:
                         s.sendto(self.createP2PMessage(MSG_ALIVE_ACK), camera_addr)
                         continue
+
                     if data[1] == MSG_DRW_ACK:
                         continue
+
                     if data[1] == MSG_DRW:
+                        stream_byte = data[5]
                         drw_payload = data[8:]
-                        # Re-challenge during stream
-                        if len(drw_payload) >= 12 and drw_payload[3] == 0x11:
-                            token = bytes(drw_payload[8:12])
-                            video_req = self.createDRWMessage(channel=0,
-                                            payload=bytes([0x01,0x0a,0x08,0x10,
-                                                        0x04,0x00,0xff,0x00]) + token)
-                            s.sendto(video_req, camera_addr)
+                        pkt_id      = int.from_bytes(data[6:8], 'big')
+
+                        # Send DRW ACK back to camera
+                        ack = bytearray(14)
+                        ack[0] = P2P_MAGIC_NUM
+                        ack[1] = MSG_DRW_ACK
+                        ack[2:4] = (10).to_bytes(2, 'big')
+                        ack[4] = 0xd2
+                        ack[5] = stream_byte
+                        ack[6:8] = (1).to_bytes(2, 'big')
+                        ack[8:10] = pkt_id.to_bytes(2, 'big')
+                        s.sendto(bytes(ack), camera_addr)
+
+                        # Control packet handling in stream loop
+                        if stream_byte == 0x00:
+                            cmd = (drw_payload[2] << 8) | drw_payload[3]
+                            logging.debug('[<] Control cmd=0x%04x: %s' % (cmd, drw_payload[:16].hex()))
+
+                            # ACK all control packets
+                            ack = bytearray(14)
+                            ack[0] = P2P_MAGIC_NUM
+                            ack[1] = MSG_DRW_ACK
+                            ack[2:4] = (10).to_bytes(2, 'big')
+                            ack[4] = 0xd2
+                            ack[5] = 0x00
+                            ack[6:8] = (1).to_bytes(2, 'big')
+                            ack[8:10] = pkt_id.to_bytes(2, 'big')
+                            s.sendto(bytes(ack), camera_addr)
+
+                            # Do NOT resend StreamStart on 0x1031 — it creates an infinite loop
+                            # Just log and continue waiting
+                            if cmd == 0x1031:
+                                logging.debug('[*] StreamStartAck in stream loop — video should follow')
                             continue
-                        f.write(drw_payload)
-                        f.flush()
-                        bytes_written += len(drw_payload)
-                        if drw_payload[0:4] == b'\x00\x00\x00\x01':
-                            h264_frames += 1
-                            if h264_frames % 30 == 0:
-                                logging.info('[*] %d frames, %d bytes'
-                                            % (h264_frames, bytes_written))
+
+                        # Data packet (stream_byte == 0x01)
+                        got_any_data = True
+                        logging.debug('[<] Data pkt_id=%d len=%d: %s'
+                                    % (pkt_id, len(drw_payload), drw_payload[:8].hex()))
+
+                        # Framed JPEG (55 aa 15 a8 header)
+                        if drw_payload[0:4] == FRAME_HEADER:
+                            stream_type = drw_payload[4] if len(drw_payload) > 4 else 0
+                            if stream_type == 0x03:  # JPEG frame
+                                jpeg_data = drw_payload[32:]  # skip 32-byte stream header
+                                if current_jpeg:
+                                    f.write(bytes(current_jpeg))
+                                    f.flush()
+                                    frame_count += 1
+                                    bytes_written += len(current_jpeg)
+                                    if frame_count % 10 == 0:
+                                        logging.info('[*] %d frames, %d bytes, %.1fs'
+                                                    % (frame_count, bytes_written,
+                                                        time.time() - start_time))
+                                current_jpeg = bytearray(jpeg_data)
+                            continue
+
+                        # Unframed JPEG start (ff d8 ff)
+                        if drw_payload[0:3] == JPEG_HEADER:
+                            if current_jpeg:
+                                f.write(bytes(current_jpeg))
+                                f.flush()
+                                frame_count += 1
+                                bytes_written += len(current_jpeg)
+                                if frame_count % 10 == 0:
+                                    logging.info('[*] %d frames, %d bytes, %.1fs'
+                                                % (frame_count, bytes_written,
+                                                    time.time() - start_time))
+                            current_jpeg = bytearray(drw_payload)
+                            continue
+
+                        # Continuation chunk
+                        if current_jpeg:
+                            current_jpeg += drw_payload
                         else:
-                            logging.debug('[<] data: %s' % drw_payload[:16].hex())
+                            # No frame started yet — log raw data
+                            logging.debug('[<] Orphan data: %s' % drw_payload[:16].hex())
+
                 except socket.timeout:
+                    if got_any_data:
+                        logging.debug('[.] timeout')
                     continue
                 except KeyboardInterrupt:
-                    logging.info('\n[*] Stopped')
+                    logging.info('\n[*] Stopped by user')
                     break
 
-        logging.info('[*] Done: %d bytes, %d H264 frames → %s'
-                    % (bytes_written, h264_frames, output_file))
-        logging.info('[*] Play: ffplay %s' % output_file)
+            # Save last frame
+            if current_jpeg:
+                f.write(bytes(current_jpeg))
+                frame_count += 1
+                bytes_written += len(current_jpeg)
+
+        logging.info('[*] Done: %d frames, %d bytes → %s'
+                    % (frame_count, bytes_written, output_file))
+        logging.info('[*] Play: ffplay -f mjpeg %s' % output_file)
         s.close()
-        return bytes_written > 0
+        return frame_count > 0
 
     def createCapsRequestPayload(self):
         """
